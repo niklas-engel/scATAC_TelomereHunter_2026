@@ -1,0 +1,832 @@
+# packages 
+```{r}
+library(ggplot2)
+library(dplyr)
+library(gghalves)
+library(forcats)
+library(tidyr)
+library(ggtext)
+library(patchwork)
+library(readr)
+library(RColorBrewer)
+library(ggrepel)
+library(grid)
+library(gtable)
+library(purrr)
+library(scales)
+library(halfmoon)
+library(stringr)
+library(cowplot)
+```
+
+
+# load data
+```{r}
+TCGA_masterdf = read_tsv("/omics/groups/OE0436/data/jgrigorjew/scTH_publication/TCGA_masterdf.tsv", show_col_types = FALSE)
+```
+```{r}
+keep_samples = c("GBMx_A90B18B6_X006", "GBMx_ED12A6C9_X003", "BRCA_14AD76EE_X003")
+```
+
+
+# simulations
+## figure 1b 
+```{r}
+telomere_length_fixed = 10000
+total_reads_vals = c(2000, 5000, 10000, 20000, 30000, 50000, 70000, 100000)
+rb_vals = seq(1, 4, by = 1)
+colors = c("#F9A71A", "#dcc729ff", "#3aa14dff", "#026F5A")
+
+p_tel_calc = function(telomere_length, ratio_bias) {
+  ((telomere_length * 2 * 23) / (3.2e9)) * ratio_bias}
+
+generate_rb_data = function(n_intra_val) {
+  expand.grid(Total_Reads = total_reads_vals, RB = rb_vals) %>%
+    mutate(p = p_tel_calc(telomere_length_fixed, RB),
+        Probability = 1 - pbinom(n_intra_val - 1, size = Total_Reads, prob = p))}
+
+intratel_5_reads_data = generate_rb_data(5)
+
+plot_rb_lines = function(df_rb) {
+  ggplot(df_rb, aes(x = Total_Reads, y = Probability, color = factor(RB))) +
+    geom_vline(xintercept = 10000, color = "#000000", size = 0.5) +
+    geom_vline(xintercept = 30000, color = "#000000", size = 0.5) +
+    geom_point(size = 3) +
+    geom_line(aes(group = RB), size = 1.2) +
+    scale_x_log10(breaks = total_reads_vals, labels = scales::comma_format()) +
+    scale_color_manual(values = colors, name = "Amplification Bias") +
+    labs(x = "log10(Total Reads)", y = "Probability") +
+    theme_minimal(base_size = 16) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      legend.position = c(0.05, 0.95),
+      legend.justification = c("left", "top"),
+      legend.background = element_rect(fill = "white", color = "white"),
+      axis.text.x = element_text(angle = 0, hjust = 1, size = 13.5),
+      axis.text.y = element_text(size = 14))
+}
+
+lineplot_sim_rb_5 = plot_rb_lines(intratel_5_reads_data)
+lineplot_sim_rb_5
+```
+
+
+## appendix 1
+```{r}
+telomere_length_fixed = 10000
+ratio_biases = c(1, 2, 3, 4)
+total_reads_vals = c(5000, 10000, 30000, 50000, 70000, 100000)
+n_intra_vals = c(1, 5, 10, 15, 20, 30, 50)
+
+generate_heatmap_fixed_rb = function(rb_val) {
+  df = expand.grid(Total_Reads = total_reads_vals, n_intra = n_intra_vals) %>%
+    mutate(p = p_tel_calc(telomere_length_fixed, rb_val),
+      Probability = 1 - pbinom(n_intra - 1, size = Total_Reads, prob = p),
+      Total_Reads = factor(Total_Reads),
+      n_intra = factor(n_intra, levels = rev(n_intra_vals)))
+
+  ggplot(df, aes(x = Total_Reads, y = n_intra, fill = Probability)) +
+    geom_tile(color = "black", linewidth = 0.3) +
+    geom_text(aes(label = sprintf("%.2f", Probability)), size = 8) +
+    scale_fill_gradientn(colors = c("white", "#D7C9FF", "#6C7CC6"), limits = c(0, 1), name = "Prob. of ≥n\nIntratelomeric Reads") +
+    labs(
+      title = paste0("Amplification Bias = ", rb_val),
+      subtitle = paste0("Telomere Length fixed at ", telomere_length_fixed, " bp"),
+      x = "Total Reads",
+      y = "Intratelomeric Reads") +
+    theme_minimal(base_size = 23) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, color = "#3F3F3F"),
+      axis.text.y = element_text(color = "#3F3F3F"),
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0))
+}
+
+plot_rb1 = generate_heatmap_fixed_rb(1)
+plot_rb2 = generate_heatmap_fixed_rb(2)
+plot_rb3 = generate_heatmap_fixed_rb(3)
+plot_rb4 = generate_heatmap_fixed_rb(4)
+
+aligned_plot_HM_total_vs_intraTel = (
+  (plot_rb1 | plot_rb2) /
+  (plot_rb3 | plot_rb4)) +
+  plot_annotation(
+    theme = theme(plot.title = element_text(size = 28, face = "bold", hjust = 0.5)))
+
+aligned_plot_HM_total_vs_intraTel
+```
+
+
+# statistically comparing TC of cancer and healthy cells per patient
+```{r}
+test_per_sample = function(df_sample) {
+  cancer_vals = df_sample %>% 
+    filter(celltype == "Cancer cell") %>% 
+    pull(openness_adj_TC)
+  
+  other_vals  = df_sample %>% 
+    filter(celltype != "Cancer cell") %>% 
+    pull(openness_adj_TC)
+
+  if (length(cancer_vals) < 2 | length(other_vals) < 2) { 
+    return(data.frame(
+      sample = unique(df_sample$sample),
+      n_c = length(cancer_vals),
+      n_o= length(other_vals),
+      medianTC_c = NA,
+      medianTC_o = NA,
+      p_value = NA,
+      effect_size = NA,
+      log2_fc = NA))
+  }
+
+  wt = wilcox.test(cancer_vals, other_vals, alternative = "two.sided")
+  es = effsize::cliff.delta(cancer_vals, other_vals)$estimate
+  fc = median(cancer_vals) / median(other_vals)
+  log2_fc = log2(fc)
+
+  data.frame(
+    sample = unique(df_sample$sample),
+    n_c = length(cancer_vals),
+    n_o = length(other_vals),
+    medianTC_c= median(cancer_vals), 
+    medianTC_o= median(other_vals),
+    p_value = wt$p.value,
+    effect_size = es,
+    log2_fc = log2_fc)
+}
+
+fix_p_zero = function(p) {
+  p[p == 0] = .Machine$double.xmin
+  return(p)}
+
+result_table = TCGA_masterdf %>%
+  group_by(sample) %>%
+  group_split() %>%
+  map_df(test_per_sample) %>%
+  mutate(
+    p_value_corrected = p.adjust(p_value, method = "BH"),
+    p_value = fix_p_zero(p_value),
+    p_value_corrected = fix_p_zero(p_value_corrected)
+  ) %>%
+  arrange(p_value_corrected) %>%
+  arrange(desc(effect_size)) %>%
+  mutate(across(where(is.numeric), ~ signif(., 4)))
+
+result_table$Cohort = substr(result_table$sample, 1, 4)
+```
+
+
+# TCGA a
+## volcano plot
+```{r}
+cohort_counts = table(result_table$Cohort)
+cohort_labels = paste0(names(cohort_counts), " (n=", cohort_counts, ")")
+
+names(cohort_labels) = names(cohort_counts)
+
+volcano_plot_cohort = ggplot(result_table, aes(x = log2_fc, y = -log10(p_value_corrected))) +
+  geom_point(aes(color = Cohort, shape = ifelse(sample %in% keep_samples, "keep", "other")),
+    size = 3,
+    alpha = 0.85) +
+  scale_shape_manual(values = c("other" = 16, "keep" = 17), guide = "none") +
+  scale_color_discrete(labels = cohort_labels) +
+  geom_text_repel(data = subset(result_table, sample %in% keep_samples),
+    aes(label = sample),
+    size = 4,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.3) +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "#1021dc77", size = 0.4) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "#1021dc77", size = 0.4) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "#1021dc77", size = 0.4) +
+  geom_hline(yintercept = 0, color = "grey20", size = 0.3) + 
+  geom_vline(xintercept = 0, color = "grey20", size = 0.3) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal") +
+  labs(
+    x = expression(Log[2]~"(adjusted TC(Cancer cells) / adjusted TC(other cells))"),
+    y = expression(-log[10](corrected ~ p-value)),
+    axis.title.y = element_text(size = 14),
+    axis.text.y  = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.text.x  = element_text(size = 12),
+    ledgend.title = element_text(size = 12),
+    ledgend.text  = element_text(size = 10),
+    color = "Cohort")
+
+volcano_plot_cohort
+```
+
+
+# TCGA 4b
+## split violin for BRCA and GBMx with corrected TC
+```{r}
+TC_GBMx_BRCA_main = TCGA_masterdf %>%
+  filter(Cohort %in% c("BRCA", "GBMx")) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other"))
+
+Main_counts = TC_GBMx_BRCA_main %>%
+  group_by(sample, cell_group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = cell_group, values_from = n, values_fill = 0)
+
+BRCA_GBMx_SplitViolin = TC_GBMx_BRCA_main %>%
+  left_join(Main_counts, by = "sample") %>%
+  mutate(
+    sample_label = paste0(sample, "\nCancer: ", Cancer, " | Other: ", Other),
+    label_color = ifelse(sample %in% keep_samples, "red", "black"))
+
+split_violin = ggplot(BRCA_GBMx_SplitViolin, aes(x = sample, y = openness_adj_TC)) +
+  geom_half_violin(data = subset(BRCA_GBMx_SplitViolin, cell_group == "Cancer"), aes(fill = "Cancer"), side = "l", trim = FALSE, alpha = 0.7) +
+  geom_half_boxplot(data = subset(BRCA_GBMx_SplitViolin, cell_group == "Cancer"), aes(fill = "Cancer"), side = "l", width = 0.3, outlier.size = 0.3) +
+  geom_half_violin(data = subset(BRCA_GBMx_SplitViolin, cell_group == "Other"), aes(fill = "Other"), side = "r", trim = FALSE, alpha = 0.7) +
+  geom_half_boxplot(data = subset(BRCA_GBMx_SplitViolin, cell_group == "Other"), aes(fill = "Other"), side = "r", width = 0.3, outlier.size = 0.3) +
+  scale_y_log10(labels = comma_format()) +
+  scale_fill_brewer(palette = "Paired", name = "Cell group") +
+  facet_grid(~ Cohort, scales = "free_x", space = "free_x") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_blank(),  
+    strip.text = element_text(size = 13),
+    legend.position = c(0.63, 0.9),
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1.2),
+    panel.spacing.x = unit(2, "lines"),
+    plot.margin = margin(40, 10, 40, 10)) +
+  labs(x = "Patient", y = "log10(Adjusted Telomere Content)") +
+  coord_cartesian(ylim = c(1e-2, 1e5), clip = "off")
+
+label_df = BRCA_GBMx_SplitViolin %>%
+  distinct(sample, Cohort, sample_label, label_color)
+
+split_violin_BG_adjusted_labels = split_violin +
+  geom_text(data = label_df, aes(x = sample, y = 1e-2, label = sample_label, color = label_color), angle = 90, hjust = 0, vjust = 0.5, inherit.aes = FALSE, size = 3.5) +
+  scale_color_identity()
+
+split_violin_BG_adjusted_labels
+```
+
+
+## App 2
+#### plot other cancer types
+```{r}
+top_half = TCGA_masterdf %>%
+  filter(Cohort %in% c("BLCA", "COAD", "KIRC")) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other"))
+
+top_counts = top_half %>%
+  group_by(sample, Cohort, cell_group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = cell_group, values_from = n, values_fill = 0) %>%
+  mutate(sample_label = paste0(sample, "\nCancer: ", Cancer, " | Other: ", Other))
+
+top_half = top_half %>%
+  left_join(top_counts %>% select(sample, Cohort, sample_label), by = c("sample", "Cohort")) %>%
+  mutate(sample_order = interaction(Cohort, sample_label, sep = "___"))
+
+top_plot = ggplot(top_half, aes(x = sample_order, y = openness_adj_TC)) +
+  geom_half_violin(data = subset(top_half, cell_group == "Cancer"), aes(fill = "Cancer"), side = "l", trim = FALSE, alpha = 0.7) +
+  geom_half_boxplot(data = subset(top_half, cell_group == "Cancer"), aes(fill = "Cancer"), side = "l", width = 0.3, outlier.size = 0.3) +
+  geom_half_violin(data = subset(top_half, cell_group == "Other"), aes(fill = "Other"), side = "r", trim = FALSE, alpha = 0.7) +
+  geom_half_boxplot(data = subset(top_half, cell_group == "Other"), aes(fill = "Other"), side = "r", width = 0.3, outlier.size = 0.3) +
+  scale_y_log10(labels = comma_format()) +
+  scale_fill_brewer(palette = "Paired", name = "Cell group") +
+  scale_x_discrete(labels = function(x) gsub(".*___", "", x)) +
+  facet_grid(~Cohort, scales = "free_x", space = "free_x") +
+  theme_minimal(base_size = 16) +
+  labs(x = NULL, y = "log10(Adjusted Telomere Content)") +
+  theme(
+    axis.text.x = element_markdown(angle = 90, vjust = 0.5, hjust = 0.5, size = 17),
+    strip.text = element_text(size = 17),
+    axis.title.y = element_text(size = 17),
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1.2),
+    panel.spacing.x = unit(3, "lines")) +
+  coord_cartesian(ylim = c(1, 1e5))
+
+bottom_half = TCGA_masterdf %>%
+  filter(Cohort %in% c("KIRP", "LUAD", "SKCM")) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other"))
+
+bottom_counts = bottom_half %>%
+  group_by(sample, Cohort, cell_group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = cell_group, values_from = n, values_fill = 0) %>%
+  mutate(sample_label = paste0(sample, "\nCancer: ", Cancer, " | Other: ", Other))
+
+bottom_half = bottom_half %>%
+  left_join(bottom_counts %>% select(sample, Cohort, sample_label), by = c("sample", "Cohort")) %>%
+  mutate(sample_order = interaction(Cohort, sample_label, sep = "___"))
+
+bottom_plot = ggplot(bottom_half, aes(x = sample_order, y = openness_adj_TC)) +
+  geom_half_violin(data = subset(bottom_half, cell_group == "Cancer"), aes(fill = "Cancer"), side = "l", trim = FALSE, alpha = 0.7) +
+  geom_half_boxplot(data = subset(bottom_half, cell_group == "Cancer"), aes(fill = "Cancer"), side = "l", width = 0.3, outlier.size = 0.3) +
+  geom_half_violin(data = subset(bottom_half, cell_group == "Other"), aes(fill = "Other"), side = "r", trim = FALSE, alpha = 0.7) +
+  geom_half_boxplot(data = subset(bottom_half, cell_group == "Other"), aes(fill = "Other"), side = "r", width = 0.3, outlier.size = 0.3) +
+  scale_y_log10(labels = comma_format()) +
+  scale_fill_brewer(palette = "Paired", name = "Cell group") +
+  scale_x_discrete(labels = function(x) gsub(".*___", "", x)) +
+  facet_grid(~Cohort, scales = "free_x", space = "free_x") +
+  theme_minimal(base_size = 16) +
+  labs(x = NULL, y = "log10(Adjusted Telomere Content)") +
+  theme(
+    axis.text.x = element_markdown(angle = 90, vjust = 0.5, hjust = 0.5, size = 17),
+    strip.text = element_text(size = 17),
+    axis.title.y = element_text(size = 17),
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1.2),
+    panel.spacing.x = unit(3, "lines")) +
+  coord_cartesian(ylim = c(1, 1e5))
+
+combined_split_violin = top_plot / bottom_plot
+combined_split_violin
+```
+
+
+# calculating z-scores for TVRs 
+```{r}
+combined_TVRs_singletonSubset = TCGA_masterdf %>%
+  filter(celltype == "Cancer cell") %>%
+  select(Barcode, celltype, sample, ends_with("_singletons_norm_by_all_reads"))
+
+singleton_cols = grep("_singletons_norm_by_all_reads$", colnames(combined_TVRs_singletonSubset), value = TRUE)
+
+df_patient_stats = combined_TVRs_singletonSubset %>%
+  group_by(sample) %>%
+  summarise(n_cells = n(), across(all_of(singleton_cols), ~ sum(.x, na.rm = TRUE), .names = "{.col}_sum")) %>%
+  mutate(across(ends_with("_sum"), ~ (.x / n_cells)*100, .names = "{.col}_per100cells"))
+
+
+percell_cols = grep("_sum_per100cells$", colnames(df_patient_stats), value = TRUE)
+
+zscore_fun_ref = function(values, sample_vec, keep_samples) {
+  ref_vals = values[!sample_vec %in% keep_samples]   
+  mu = mean(ref_vals, na.rm = TRUE)
+  sigma = sd(ref_vals, na.rm = TRUE)
+  (values - mu) / sigma}
+
+df_patient_zscores = df_patient_stats %>%
+  select(sample, all_of(percell_cols)) %>%
+  mutate(across(all_of(percell_cols), ~ zscore_fun_ref(.x, sample_vec = df_patient_stats$sample, keep_samples = keep_samples), .names = "{.col}_zscore")) %>%
+  select(sample, ends_with("_zscore"))
+
+df_patient_stat_combined = df_patient_stats %>%
+  left_join(df_patient_zscores, by = "sample")
+
+df_patient_stat_combined
+```
+
+
+## create summary table 
+```{r}
+df_long = df_patient_stats %>%
+  pivot_longer(cols = ends_with("_sum_per100cells"), names_to = "singleton", values_to = "sum_per100cells") %>%
+  mutate(singleton = sub("_singletons_norm_by_all_reads_sum_per100cells$", "", singleton))
+
+df_long = df_long %>%
+  group_by(singleton) %>%
+  mutate(zscore = zscore_fun_ref(sum_per100cells, sample_vec = sample, keep_samples = keep_samples)) %>%
+  ungroup() %>%
+  mutate(
+    p_value = 2 * (1 - pnorm(abs(zscore))),
+    p_adj   = p.adjust(p_value, method = "BH"),
+    TVR_type = sub("_.*$", "", singleton))
+
+min_nonzero_p = min(df_long$p_value[df_long$p_value > 0], na.rm = TRUE)
+
+fmt_sci4 = function(x) {formatC(x, format = "e", digits = 4)}
+
+df_long = df_long %>%
+  mutate(
+    p_value_raw = p_value,  
+    p_value = case_when(
+      p_value == 0 ~ paste0("< ", fmt_sci4(min_nonzero_p)),
+      TRUE ~ fmt_sci4(p_value)),
+    p_adj = case_when(
+      p_adj == 0 ~ paste0("< ", fmt_sci4(min_nonzero_p)),
+      TRUE ~ fmt_sci4(p_adj)))
+
+zscores_summary = df_long %>%
+  filter(abs(zscore) > 3) %>%
+  select(sample, TVR_type, sum_per100cells, zscore, p_value, p_adj) %>%
+  mutate(
+    sum_per100cells = round(sum_per100cells, 5),
+    zscore = round(zscore, 5)) %>%
+  arrange(sample, desc(abs(zscore)))
+```
+
+
+# Appendix Figure 8
+## volcano plot for z-scores
+```{r}
+smallest_p = df_long$p_value |>
+  as.character() |>                   
+  (\(x) x[!grepl("^<", x)])() |>               
+  as.numeric() |>   
+  (\(x) x[!is.na(x) & !is.nan(x)])() |>                  
+  min()                                                  
+
+patients_outlier = df_long %>%
+  mutate(is_outlier = abs(zscore) > 3) %>%
+  group_by(sample) %>%
+  summarize(has_outlier = any(is_outlier), .groups = "drop")
+
+df_volcano <- df_long %>%
+  left_join(patients_outlier, by = "sample") %>%
+  mutate(
+    p_value_numeric = case_when(grepl("^<", p_value) ~ smallest_p, TRUE ~ as.numeric(p_value)),
+    singleton = sub("_.*", "", singleton)) %>%
+  mutate(
+    p_value_adj = p.adjust(p_value_numeric, method = "BH"),
+    neg_log10_p_adj = -log10(p_value_adj))
+
+df_volcano_filtered = df_volcano %>%
+  filter(has_outlier, singleton != "ATAGGG")
+
+outlier_patients = df_volcano_filtered %>%
+  distinct(sample) %>%
+  arrange(sample) %>%
+  mutate(indiv_shape = 0:(n() - 1))
+
+df_volcano_filtered = df_volcano_filtered %>%
+  left_join(outlier_patients, by = "sample") %>%
+  mutate(final_shape = indiv_shape)
+
+tvr_cols = c(
+  "ATAGGG" = "#A6CEE3", 
+  "CATGGG" = "#1F78B4", 
+  "CTAGGG" = "#B2DF8A",
+  "GTAGGG" = "#33A02C",
+  "TAAGGG" = "#FB9A99",
+  "TCAGGG" = "#E31A1C",
+  "TGAGGG" = "#FDBF6F",
+  "TTCGGG" = "#FF7F00",
+  "TTGGGG" = "#CAB2D6",
+  "TTTGGG" = "#6A3D9A"
+)
+
+shape_labels = df_volcano_filtered %>%
+  distinct(final_shape, sample) %>%
+  mutate(shape_label = sample) %>%
+  arrange(final_shape)
+
+shape_values = sort(unique(df_volcano_filtered$final_shape))
+shape_labels_vec = shape_labels$shape_label[
+  match(shape_values, shape_labels$final_shape)]
+
+volcano_plot_zscores_sig = ggplot(df_volcano_filtered, aes(x = log2(abs(zscore)), y = neg_log10_p_adj, col = singleton, shape = factor(final_shape))) +
+  geom_point(size = 2.5, position = position_jitter(h = 0.5, w = 0.5)) +
+  geom_hline(yintercept = 2, linetype = "dashed") +
+  geom_vline(xintercept = log2(3), linetype = "dashed") +
+  scale_color_manual(values = tvr_cols, name = "sTVR type") +
+  scale_shape_manual(values = shape_values, labels = shape_labels_vec, name = "Patient") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 8),
+    legend.position = "right",
+    legend.box = "vertical",
+    strip.background = element_blank(),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    axis.title.y = element_text(size = 14),
+    axis.text.y  = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.text.x  = element_text(size = 12)) +
+  labs(
+    x = expression(log[2](z-score)),
+    y = expression(-log[10](adjusted~p-value)))
+
+volcano_plot_zscores_sig
+```
+
+
+
+# TCGA c - BRCA, GBMx, other - absolute summed singleton TVR signal (stacked bar plot)
+```{r}
+df_long_TVR_plot = TCGA_masterdf %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  pivot_longer(
+    cols = ends_with("_singletons_norm_by_all_reads"),
+    names_to = "TVR",
+    values_to = "Value") %>%
+  mutate(TVR = gsub("_singletons_norm_by_all_reads$", "", TVR))
+
+df_summed = df_long_TVR_plot %>%
+  group_by(sample, cell_group, TVR) %>%
+  summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+
+others_mean = df_summed %>%
+  filter(!(sample %in% keep_samples)) %>%
+  group_by(cell_group, TVR) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(sample = "Other Patients (mean)")
+
+df_plot_subset = bind_rows(df_summed %>% filter(sample %in% keep_samples), others_mean)
+
+df_plot_subset$sample = factor(df_plot_subset$sample, levels = c(keep_samples, "Other Patients (mean)"))
+
+cell_counts_individual = TCGA_masterdf %>%
+  filter(sample %in% keep_samples) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  group_by(sample, cell_group) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(cell_group_label = paste0(cell_group, "\nn=", n_cells))
+
+cell_counts_others = TCGA_masterdf %>%
+  filter(!(sample %in% keep_samples)) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  group_by(cell_group) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(sample = "Other Patients (mean)", cell_group_label = paste0(cell_group, "\nn=", n_cells))
+
+cell_counts_all = bind_rows(cell_counts_individual, cell_counts_others)
+
+df_plot_subset = df_plot_subset %>%
+  left_join(cell_counts_all %>% select(sample, cell_group, cell_group_label), by = c("sample", "cell_group"))
+
+p4_small_TVRbars_count = ggplot(df_plot_subset, aes(x = cell_group_label, y = Value, fill = TVR)) +
+  geom_col(width = 0.8) +
+  facet_grid(~ sample, scales = "free_x", space = "free_x") +
+  scale_fill_brewer(palette = "Paired") +
+  labs(
+    x = "Cell group",
+    y = "sTVRs per total Reads",
+    fill = "TVR Class") +
+  theme_minimal() +
+  theme(
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1),
+    strip.text = element_text(size = 10),
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5, size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y  = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    legend.position = c(0.95, 0.5),
+    legend.justification = c(1, 0.5),
+    legend.direction = "vertical",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    panel.spacing.x = unit(1, "lines")
+  )
+
+p4_small_TVRbars_count
+```
+
+
+# TCGA d - BRCA, GBMx, other - relative summed singleton TVR signal (stacked bar plot)
+```{r}
+keep_samples = as.character(keep_samples)
+
+df_long_TVR_plot = TCGA_masterdf %>%
+  pivot_longer(cols = ends_with("_singletons_norm_by_all_reads"), names_to = "TVR", values_to = "Value") %>%
+  mutate(TVR = gsub("_singletons_norm_by_all_reads$", "", TVR),
+    cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other"))
+
+df_summed = df_long_TVR_plot %>%
+  group_by(sample, cell_group, TVR) %>%
+  summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+
+others_mean = df_summed %>%
+  filter(!(sample %in% keep_samples)) %>%
+  group_by(cell_group, TVR) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(sample = "Other Patients (mean)")
+
+df_plot_subset = bind_rows(
+  df_summed %>% filter(sample %in% keep_samples),
+  others_mean)
+
+df_plot_subset$sample = factor(df_plot_subset$sample, levels = c(keep_samples, "Other Patients (mean)"))
+
+df_plot_subset = df_plot_subset %>%
+  group_by(sample, cell_group) %>%
+  mutate(Value_rel = Value / sum(Value)) %>%
+  ungroup()
+
+cell_counts_individual = combined_TVRs_filtered %>%
+  filter(sample %in% keep_samples) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  group_by(sample, cell_group) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(cell_group_label = paste0(cell_group, "\nn=", n_cells))
+
+cell_counts_others = combined_TVRs_filtered %>%
+  filter(!(sample %in% keep_samples)) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  group_by(cell_group) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(sample = "Other Patients (mean)", cell_group_label = paste0(cell_group, "\nn=", n_cells))
+
+cell_counts_all = bind_rows(cell_counts_individual, cell_counts_others)
+
+df_plot_subset = df_plot_subset %>%
+  left_join(cell_counts_all %>% select(sample, cell_group, cell_group_label), by = c("sample", "cell_group"))
+
+p4_small_TVRbars_relative = ggplot(df_plot_subset, aes(x = cell_group_label, y = Value_rel, fill = TVR)) +
+  geom_col(width = 0.8) +
+  facet_grid(~ sample, scales = "free_x", space = "free_x") +
+  scale_fill_brewer(palette = "Paired") +
+  labs(
+    x = "Cell group",
+    y = "Relative sTVRs per total Reads (%)",
+    fill = "TVR Class") +
+  theme_minimal() +
+  theme(
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1),
+    strip.text = element_text(size = 10, face = "plain"),
+
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5, size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y  = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    legend.position = "none",
+    panel.spacing.x = unit(1, "lines"))
+
+p4_small_TVRbars_relative
+```
+
+```{r}
+df_long_TVR_plot = TCGA_masterdf %>%
+  pivot_longer(cols = ends_with("_singletons_norm_by_all_reads"), names_to = "TVR", values_to = "Value") %>%
+  mutate(
+    TVR = gsub("_singletons_norm_by_all_reads$", "", TVR),
+    cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other"))
+
+df_summed = df_long_TVR_plot %>%
+  group_by(sample, cell_group, TVR) %>%
+  summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+
+others_mean = df_summed %>%
+  filter(!(sample %in% keep_samples)) %>%
+  group_by(cell_group, TVR) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(sample = "Other Patients (mean)")
+
+df_plot_subset = bind_rows(df_summed %>% 
+    filter(sample %in% keep_samples), others_mean)
+
+df_plot_subset$sample = factor(
+  df_plot_subset$sample,
+  levels = c(keep_samples, "Other Patients (mean)"))
+
+df_plot_subset = df_plot_subset %>%
+  group_by(sample, cell_group) %>%
+  mutate(Value_rel = Value / sum(Value)) %>%
+  ungroup()
+
+cell_counts_individual = TCGA_masterdf %>%
+  filter(sample %in% keep_samples) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  group_by(sample, cell_group) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(cell_group_label = paste0(cell_group, "\nn=", n_cells))
+
+cell_counts_others = TCGA_masterdf %>%
+  filter(!(sample %in% keep_samples)) %>%
+  mutate(cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  group_by(cell_group) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(
+    sample = "Other Patients (mean)",
+    cell_group_label = paste0(cell_group, "\nn=", n_cells))
+
+cell_counts_all = bind_rows(cell_counts_individual, cell_counts_others)
+
+df_plot_subset = df_plot_subset %>%
+  left_join(cell_counts_all %>% select(sample, cell_group, cell_group_label),
+            by = c("sample", "cell_group"))
+
+p4_small_TVRbars_relative = ggplot(df_plot_subset, aes(x = cell_group_label, y = Value_rel, fill = TVR)) +
+  geom_col(width = 0.8) +
+  facet_grid(~ sample, scales = "free_x", space = "free_x") +
+  scale_fill_brewer(palette = "Paired") +
+  labs(
+    x = "Cell group",
+    y = "Relative sTVRs per total Reads (%)",
+    fill = "TVR Class") +
+  theme_minimal() +
+  theme(
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1),
+    strip.text = element_text(size = 10),
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5, size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y  = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    legend.position = "none",
+    panel.spacing.x = unit(1, "lines")
+  )
+
+p4_small_TVRbars_relative
+```
+
+
+
+# Figure 4 assembly 
+```{r}
+row2_actual = plot_grid(p4_small_TVRbars_count, p4_small_TVRbars_relative, nrow = 1, rel_widths = c(1, 1), labels = c("c", "d"))
+
+row2 = plot_grid(row2_actual, ggplot() + theme_void(), nrow = 1, rel_widths = c(1, 0.05))
+
+row1 = plot_grid(volcano_plot_cohort, split_violin_BG_adjusted_labels, nrow = 1, rel_widths = c(0.35, 0.65), labels = c("a", "b"))
+
+Figure4 = plot_grid(row1, row2, nrow = 2, rel_heights = c(0.6, 0.40))
+
+ggsave(filename = "Figure4.pdf", plot = Figure4, path = "/omics/groups/OE0436/data/jgrigorjew/scTH_publication/plots/",
+  width = 18, height = 11, units = "in", dpi = 600)
+ggsave(filename = "Figure4.png", plot = Figure4, path = "/omics/groups/OE0436/data/jgrigorjew/scTH_publication/plots/",
+  width = 18, height = 11, units = "in", dpi = 600)
+```
+
+
+# subclone analysis 
+## app 3a - TC boxplot 
+```{r}
+sample_colors = c("GBMx_193F811A_X009" = "#1f77b4", "GBMx_A90B18B6_X006" = "#1C299E")
+
+df_boxplot = TCGA_masterdf %>%
+  filter(!is.na(subcloneclusters), subcloneclusters != "N", subcloneclusters != "not available") %>% 
+  group_by(sample, subcloneclusters) %>%
+  mutate(n_cells = n(), subclone_label = paste0(subcloneclusters, "\nn=", n_cells)) %>%
+  ungroup()
+
+if (exists("sample_colors")) {
+  df_boxplot$sample = factor(df_boxplot$sample, levels = names(sample_colors))}
+
+p_box_telcontent = ggplot(df_boxplot, aes(x = subclone_label, y = openness_adj_TC, fill = sample)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = 21, width = 0.7) +
+  facet_grid(~ sample, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = sample_colors) +
+  scale_y_log10() +
+  labs(
+    x = "Subclone Cluster",
+    y = "log10(Adjusted Telomere Content)",
+    fill = "Sample") +
+  theme_minimal() +
+  theme(
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1),
+    strip.text = element_text(size = 14, face = "plain"),
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5, size = 16),
+    axis.title.y = element_text(size = 20),
+    axis.text.y  = element_text(size = 18),
+    axis.title.x = element_text(size = 20),
+    legend.position = "none",
+    panel.spacing.x = unit(1, "lines"))
+
+p_box_telcontent
+```
+
+
+## App 3b - TVR stacked barplot
+```{r}
+df_long_TVR = TCGA_masterdf %>%
+  filter(!is.na(subcloneclusters), subcloneclusters != "N", subcloneclusters != "not available") %>%
+  pivot_longer(
+    cols = ends_with("_singletons_norm_by_all_reads"),
+    names_to = "TVR",
+    values_to = "Value") %>%
+  mutate(
+    TVR = gsub("_singletons_norm_by_all_reads$", "", TVR),
+    cell_group = ifelse(celltype == "Cancer cell", "Cancer", "Other")) %>%
+  group_by(sample, subcloneclusters) %>%
+  mutate(Relative_Value = Value / sum(Value, na.rm = TRUE)) %>%
+  ungroup()
+
+df_summed = df_long_TVR %>%
+  group_by(sample, subcloneclusters, TVR) %>%
+  summarise(Relative_Value = sum(Relative_Value, na.rm = TRUE), .groups = "drop")
+
+cell_counts = TCGA_masterdf %>%
+  filter(!is.na(subcloneclusters), subcloneclusters != "N", subcloneclusters != "not available") %>%
+  group_by(sample, subcloneclusters) %>%
+  summarise(n_cells = n(), .groups = "drop") %>%
+  mutate(subclone_label = paste0(subcloneclusters, "\nn=", n_cells))
+
+df_plot_subset = df_summed %>%
+  left_join(cell_counts %>% select(sample, subcloneclusters, subclone_label), by = c("sample", "subcloneclusters"))
+
+df_plot_subset$sample = factor(df_plot_subset$sample, levels = unique(df_plot_subset$sample))
+
+p_TVRbars_subclones = ggplot(df_plot_subset, aes(x = subclone_label, y = Relative_Value, fill = TVR)) +
+  geom_col(width = 0.8) +
+  facet_grid(~ sample, scales = "free_x", space = "free_x") +
+  scale_fill_brewer(palette = "Paired") +
+  labs(
+    x = "Subclone Cluster",
+    y = "Relative sTVRs per total Reads",
+    fill = "TVR Class") +
+  theme_minimal() +
+  theme(
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1),
+    strip.text = element_text(size = 14, face = "plain"),
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5, size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.y  = element_text(size = 18),
+    axis.title.x = element_text(size = 20),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    panel.spacing.x = unit(1, "lines"))
+
+p_TVRbars_subclones
+```
